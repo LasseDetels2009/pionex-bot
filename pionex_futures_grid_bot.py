@@ -377,7 +377,7 @@ class PionexFuturesGridBot:
 
             status_msg = (
                 f"\U0001F4CA <b>Bot Status</b>\n\n"
-                f"\U0001F501 Live Trading: {'\u2705 Aktiv' if self.is_live_trading else '\u274C Inaktiv'}\n"
+                f"\U0001F501 Live Trading: {'✅ Aktiv' if self.is_live_trading else '❌ Inaktiv'}\n"
                 f"\U0001F4B0 Accountbalance: <b>{self.current_balance:.2f} USDT</b>\n"
                 f"\U0001F4C8 Gewinn/Verlust: <b>{pnl_sum:+.2f} USDT</b> ({pnl_pct:+.2f}%)\n"
                 f"\U0001F4C2 Offene Positionen: <b>{num_positions}</b>\n"
