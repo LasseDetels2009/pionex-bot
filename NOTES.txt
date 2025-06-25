@@ -6,5 +6,16 @@ Binance API
 Schlüssel: Krj3gnismqpbqftDC2E0BLvZj8ny5hNN52M3rs0tqd30aQXn1n1Hri9mo0E5Z64w
 Geheimschlüssel: QCrsCK7x8R5xGtIcOaGwLuELkoScZmmc11Eoe0plN41GYlt32q62EZxyXPRfsjPC
 
-VM verbinden
-ssh -i C:\Users\detels\OneDrive - Drive Consulting GmbH\Desktop\grid_bot_chatgpt\V8_Bot_Pionex\V1_Futures_Grid_Bot/ssh-key-2025-06-24.key ubuntu@http://158.180.18.17/
+Änderungen hochladen
+1. VM verbinden
+ssh -i "C:\Users\detels\OneDrive - Drive Consulting GmbH\Desktop\grid_bot_chatgpt\V8_Bot_Pionex\V1_Futures_Grid_Bot/ssh-key-2025-06-24.key" ubuntu@158.180.18.17
+2. Änderungen in Git pushen (Im Terminal mit geöffneten Ordner)
+git add . [1. speichern eines gits]
+git commit -m "Kommentieren der Anpassungen" [2. speichern eines gits]
+git push
+3. Änderungen auf VM holen wenn VM verbunden
+cd pionex_bot
+git pull
+./deploy.sh
+
+

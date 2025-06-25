@@ -22,8 +22,36 @@ class PionexFuturesGridBot:
     Enhanced with Telegram Bot Control Interface
     """
     
+    # Mapping: Nummer -> (Config-Key, Beschreibung)
+    CONFIG_PARAMS = {
+        1: ("initial_balance", "Startkapital in USDT"),
+        2: ("leverage", "Hebelwirkung (z.B. 3)"),
+        3: ("grid_count", "Anzahl der Grid-Levels"),
+        4: ("investment_amount", "Investitionsbetrag pro Grid"),
+        5: ("fee_rate", "Trading-Gebühr pro Trade"),
+        6: ("funding_rate", "Funding Fee alle 8h"),
+        7: ("liquidation_buffer", "Sicherheitspuffer vor Liquidierung"),
+        8: ("stop_loss_pct", "Stop-Loss in Prozent"),
+        9: ("take_profit_pct", "Take-Profit in Prozent"),
+        10: ("max_open_positions", "Maximal offene Positionen"),
+        11: ("trailing_stop_pct", "Trailing Stop in Prozent"),
+        12: ("adaptive_grid_enabled", "Adaptives Grid aktiv (1=ja,0=nein)"),
+        13: ("dynamic_leverage_enabled", "Dynamischer Hebel aktiv (1=ja,0=nein)"),
+        14: ("risk_management_enabled", "Risikomanagement aktiv (1=ja,0=nein)"),
+        15: ("mode", "Handelsmodus: long/short"),
+        16: ("report_interval", "Report-Intervall (Backtest)"),
+        17: ("save_interval", "Speicherintervall (Backtest)"),
+        18: ("live_trading_enabled", "Live-Trading aktiv (1=ja,0=nein)"),
+        19: ("live_trading_duration_minutes", "Live-Trading Dauer (Minuten)"),
+        20: ("live_trading_interval_seconds", "Live-Trading Loop-Intervall (Sekunden)"),
+        21: ("enable_profitability_check", "Profitabilitätsprüfung aktiv (1=ja,0=nein)"),
+        22: ("min_grid_pct_for_profit_check", "Min. Grid-% für Profit-Check (z.B. 0.1)"),
+        23: ("min_grid_abs_warn", "Warnung bei Grid-Abstand < X USDT (z.B. 130)")
+    }
+    
     def __init__(self, config_file: str = "pionex_config.json"):
         self.config = self.load_config(config_file)
+        self.ensure_config_defaults()
         self.setup_logging()
         
         # Initialize Telegram bot state BEFORE setup_telegram
@@ -87,6 +115,16 @@ class PionexFuturesGridBot:
         self.max_open_positions = self.config.get('max_open_positions', 15)
         self.trailing_stop_pct = self.config.get('trailing_stop_pct', 0.01)  # 1% Trailing Stop als Default
         self.reporting_mode = 'normal'  # 'normal' oder 'detailliert'
+    
+    def ensure_config_defaults(self):
+        defaults = {
+            "enable_profitability_check": True,
+            "min_grid_pct_for_profit_check": 0.1,
+            "min_grid_abs_warn": 130.0
+        }
+        for k, v in defaults.items():
+            if k not in self.config:
+                self.config[k] = v
     
     def load_config(self, config_file: str) -> Dict:
         """Load configuration from JSON file"""
@@ -329,6 +367,35 @@ class PionexFuturesGridBot:
             elif cmd == '/reporting_detailliert':
                 self.reporting_mode = 'detailliert'
                 self.send_telegram_message("📢 Detailliertes Reporting ist jetzt AKTIV. Bei jedem Kurscheck werden Grid-Infos gesendet.")
+            elif cmd == '/version':
+                self.cmd_version(chat_id)
+            elif cmd == '/set' and args:
+                # /set Nummer:Wert
+                try:
+                    num, val = args[0].split(':')
+                    num = int(num)
+                    if num in self.CONFIG_PARAMS:
+                        key, _ = self.CONFIG_PARAMS[num]
+                        # Typkonvertierung
+                        if isinstance(self.config.get(key, None), bool):
+                            self.config[key] = bool(int(val))
+                        elif isinstance(self.config.get(key, None), int):
+                            self.config[key] = int(val)
+                        elif isinstance(self.config.get(key, None), float):
+                            self.config[key] = float(val)
+                        else:
+                            self.config[key] = val
+                        self.send_telegram_message(f"Parameter {num} ({key}) wurde auf {val} gesetzt.")
+                    else:
+                        self.send_telegram_message(f"Unbekannte Parameternummer: {num}")
+                except Exception as e:
+                    self.send_telegram_message(f"Fehler beim Setzen: {e}")
+            elif cmd == '/paraminfo':
+                msg = "<b>Konfigurierbare Parameter:</b>\n"
+                for num, (key, desc) in self.CONFIG_PARAMS.items():
+                    val = self.config.get(key, 'n/a')
+                    msg += f"{num}: {key} = {val}  // {desc}\n"
+                self.send_telegram_message(msg)
             else:
                 self.send_telegram_message(f"❌ Unbekannter Befehl: {cmd}\nVerwende /help für verfügbare Befehle")
                 
@@ -795,6 +862,10 @@ class PionexFuturesGridBot:
         help_msg += "/reset_stats - Setzt alle Statistiken zurück (z.B. nach Bot-Neustart)\n"
         help_msg += "/reporting_normal - Normales Reporting (nur Trades)\n"
         help_msg += "/reporting_detailliert - Detailliertes Reporting (Grid-Infos bei jedem Kurscheck)\n"
+        help_msg += "/version - Zeigt das Datum des letzten Bot-Updates (Codeänderung)\n"
+        
+        help_msg += "/set <Nummer>:<Wert> - Setzt einen Parameter live\n"
+        help_msg += "/paraminfo - Zeigt alle konfigurierbaren Parameter mit Erklärung\n"
         
         self.send_telegram_message(help_msg)
 
@@ -1808,9 +1879,29 @@ Liquidations: {results['liquidated_positions']}
                 # Korrigierte Grid-Logik: Nur beim echten Grid-Cross handeln
                 if last_price is not None:
                     for grid_price in self.grid_prices:
+                        grid_abs = abs(grid_price - price)
+                        # Warnung bei zu kleinem Grid-Abstand
+                        if grid_abs < self.config.get('min_grid_abs_warn', 130.0):
+                            warn_level = self.config.get('min_grid_abs_warn', 130.0)
+                            self.send_telegram_message(f"⚠️ Warnung: Grid-Abstand {grid_abs:.2f} USDT ist kleiner als {warn_level:.2f} USDT!")
                         # Buy: Cross von oben nach unten
                         if last_price > grid_price >= price:
-                            if not any(p['entry_price'] == grid_price and p['side'] == 'long' for p in self.positions):
+                            # Profitabilitätsprüfung
+                            grid_pct = abs(grid_price - price) / price * 100
+                            check_profit = self.config.get('enable_profitability_check', True)
+                            min_grid_pct = self.config.get('min_grid_pct_for_profit_check', 0.1)
+                            if grid_pct < min_grid_pct:
+                                check_profit = False
+                            is_profitable = True
+                            if check_profit:
+                                # Berechne erwarteten Netto-Gewinn für Grid-Sell
+                                position_size = self.calculate_position_size(grid_price)
+                                fee_rate = self.config['fee_rate']
+                                buy_fee = position_size * grid_price * fee_rate
+                                sell_fee_grid = position_size * grid_price * fee_rate
+                                grid_sell_pnl = ((grid_price - price) * position_size * self.config['leverage']) - buy_fee - sell_fee_grid
+                                is_profitable = grid_sell_pnl > 0
+                            if is_profitable and not any(p['entry_price'] == grid_price and p['side'] == 'long' for p in self.positions):
                                 if len(self.positions) < self.max_open_positions:
                                     self.execute_trade(grid_price, 'buy', timestamp)
                         # Sell: Cross von unten nach oben
@@ -1884,6 +1975,26 @@ Liquidations: {results['liquidated_positions']}
             self.send_telegram_message("🔕 Detailliertes Reporting ist jetzt DEAKTIVIERT. Nur noch Benachrichtigungen bei Trades.")
         else:
             self.send_telegram_message(f"Aktueller Reporting-Modus: <b>{self.reporting_mode.upper()}</b>\nNutze /reporting detailliert oder /reporting normal zum Umschalten.")
+
+    def cmd_version(self, chat_id: str):
+        import os, datetime
+        msg = ""
+        # Git-Commit und Datum
+        try:
+            git_info = os.popen('git log -1 --format="%h %cd" --date=iso').read().strip()
+            if git_info:
+                msg += f"🔢 Letzter Git-Commit: {git_info}\n"
+        except Exception:
+            pass
+        # Fallback: Änderungsdatum der Hauptdatei
+        try:
+            file = os.path.abspath(__file__)
+            mtime = os.path.getmtime(file)
+            dt = datetime.datetime.fromtimestamp(mtime)
+            msg += f"🗓️ Letztes Datei-Update: {dt.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        except Exception as e:
+            msg += f"❌ Fehler beim Versions-Check: {e}"
+        self.send_telegram_message(msg)
 
 def main():
     """Main function to run the bot"""
