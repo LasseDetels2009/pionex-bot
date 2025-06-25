@@ -85,6 +85,8 @@ class PionexFuturesGridBot:
         
         # In __init__ nach self.config laden:
         self.max_open_positions = self.config.get('max_open_positions', 15)
+        self.trailing_stop_pct = self.config.get('trailing_stop_pct', 0.01)  # 1% Trailing Stop als Default
+        self.reporting_mode = 'normal'  # 'normal' oder 'detailliert'
     
     def load_config(self, config_file: str) -> Dict:
         """Load configuration from JSON file"""
@@ -321,6 +323,12 @@ class PionexFuturesGridBot:
                 self.cmd_liquidate_preview(chat_id)
             elif cmd == '/reset_stats':
                 self.cmd_reset_stats(chat_id)
+            elif cmd == '/reporting_normal':
+                self.reporting_mode = 'normal'
+                self.send_telegram_message("🔕 Detailliertes Reporting ist jetzt DEAKTIVIERT. Nur noch Benachrichtigungen bei Trades.")
+            elif cmd == '/reporting_detailliert':
+                self.reporting_mode = 'detailliert'
+                self.send_telegram_message("📢 Detailliertes Reporting ist jetzt AKTIV. Bei jedem Kurscheck werden Grid-Infos gesendet.")
             else:
                 self.send_telegram_message(f"❌ Unbekannter Befehl: {cmd}\nVerwende /help für verfügbare Befehle")
                 
@@ -784,6 +792,9 @@ class PionexFuturesGridBot:
         help_msg += "/debug on - Debug aktivieren\n"
         help_msg += "/logs recent - Letzte Logs\n"
         help_msg += "/debug info - System-Info"
+        help_msg += "/reset_stats - Setzt alle Statistiken zurück (z.B. nach Bot-Neustart)\n"
+        help_msg += "/reporting_normal - Normales Reporting (nur Trades)\n"
+        help_msg += "/reporting_detailliert - Detailliertes Reporting (Grid-Infos bei jedem Kurscheck)\n"
         
         self.send_telegram_message(help_msg)
 
@@ -1000,34 +1011,33 @@ class PionexFuturesGridBot:
         """Execute a trade with realistic conditions and detailed Telegram notifications"""
         if leverage is None:
             leverage = self.config['leverage']
-        
         position_size = self.calculate_position_size(price)
-        
         if position_size <= 0:
             return False
-        
         executed_price = self.simulate_order_execution(price, side == 'buy', position_size)
-        
         if executed_price is None:
             return False
-        
+        # Korrektur: Mapping von 'buy' auf 'long', 'sell' auf 'short'
+        if side == 'buy':
+            position_side = 'long'
+        elif side == 'sell':
+            position_side = 'short'
+        else:
+            position_side = side  # fallback
         position = {
             'id': len(self.positions) + 1,
-            'side': side,
+            'side': position_side,
             'entry_price': executed_price,
             'size': position_size,
             'timestamp': timestamp,
             'leverage': leverage,
             'buy_fee': position_size * executed_price * self.config['fee_rate'],
-            'trailing_stop': executed_price * (1 - self.trailing_stop_pct) if side == 'long' else executed_price * (1 + self.trailing_stop_pct),
-            'trailing_high': executed_price if side == 'long' else executed_price
+            'trailing_stop': executed_price * (1 - self.trailing_stop_pct) if position_side == 'long' else executed_price * (1 + self.trailing_stop_pct),
+            'trailing_high': executed_price if position_side == 'long' else executed_price
         }
-        
         self.positions.append(position)
-        
         fee = position_size * executed_price * self.config['fee_rate']
         self.total_fees += fee
-        
         # Detaillierte Telegram-Benachrichtigung für Trade
         # Berechne nächstes Grid-Sell-Level oberhalb des Einstiegskurses
         next_grid_sell = None
@@ -1045,6 +1055,19 @@ class PionexFuturesGridBot:
         sl = executed_price * (1 - self.config['stop_loss_pct'])
         dist_sl = sl - executed_price
         pct_sl = (dist_sl / executed_price) * 100
+        # PnL-Berechnung für Grid-Sell und Take-Profit (jeweils nach Gebühren)
+        grid_sell_pnl = None
+        grid_sell_pct = None
+        tp_pnl = None
+        tp_pct = None
+        if next_grid_sell:
+            sell_fee_grid = position_size * next_grid_sell * self.config['fee_rate']
+            buy_fee = fee
+            grid_sell_pnl = ((next_grid_sell - executed_price) * position_size * leverage) - buy_fee - sell_fee_grid
+            grid_sell_pct = (grid_sell_pnl / (executed_price * position_size)) * 100
+        sell_fee_tp = position_size * tp * self.config['fee_rate']
+        tp_pnl = ((tp - executed_price) * position_size * leverage) - fee - sell_fee_tp
+        tp_pct = (tp_pnl / (executed_price * position_size)) * 100
         trade_msg = f"""
 💚 <b>TRADE AUSGEFÜHRT: {side.upper()}</b>
 
@@ -1057,10 +1080,10 @@ class PionexFuturesGridBot:
 
 📊 <b>Verkaufsziele:</b>\n"""
         if next_grid_sell:
-            trade_msg += f"• Nächstes Grid-Sell: ${next_grid_sell:,.2f} (+{dist_grid:,.2f} USDT, +{pct_grid:.2f}%)\n"
+            trade_msg += f"• Nächstes Grid-Sell: ${next_grid_sell:,.2f} (+{dist_grid:,.2f} USDT, +{pct_grid:.2f}%) | Netto PnL: {grid_sell_pnl:+.2f} USDT ({grid_sell_pct:+.2f}%)\n"
         else:
             trade_msg += "• Nächstes Grid-Sell: Kein Grid oberhalb\n"
-        trade_msg += f"• Take Profit: ${tp:,.2f} (+{dist_tp:,.2f} USDT, +{pct_tp:.2f}%)\n"
+        trade_msg += f"• Take Profit: ${tp:,.2f} (+{dist_tp:,.2f} USDT, +{pct_tp:.2f}%) | Netto PnL: {tp_pnl:+.2f} USDT ({tp_pct:+.2f}%)\n"
         trade_msg += f"• Stop Loss: ${sl:,.2f} ({dist_sl:,.2f} USDT, {pct_sl:.2f}%)\n"
         trade_msg += f"\n💸 Gebühr: ${fee:.2f}\n⏰ Zeit: {timestamp.strftime('%Y-%m-%d %H:%M:%S')}\n        """
         self.send_telegram_message(trade_msg)
@@ -1096,7 +1119,7 @@ class PionexFuturesGridBot:
         self.trades.append(trade)
         unrealized_pnl = (price - position['entry_price']) * position['size'] * position['leverage']
         close_msg = f"""
-🔴 <b>POSITION GESCHLOSSEN: #{position['id']}</b>\n\n💰 <b>Trade Details:</b>\n• Einstiegskurs: ${position['entry_price']:,.2f}\n• Verkaufskurs: ${executed_price:,.2f}\n• Menge: {position['size']:.6f} BTC\n• Hebel: {position['leverage']:.1f}x\n\n📈 <b>Gewinn/Verlust:</b>\n• Unrealisierter PnL vor Verkauf: {unrealized_pnl:+.2f} USDT\n• PnL: ${pnl:,.2f} ({pnl_percentage:+.2f}%)\n• Gebühr Buy: ${buy_fee:.2f}\n• Gebühr Sell: ${sell_fee:.2f}\n• Netto PnL: ${pnl - buy_fee - sell_fee:,.2f}\n\n📊 <b>Hypothetische Gewinne:</b>\n• Bei Grid-Sell: {grid_sell_pnl:+.2f} USDT ({grid_sell_pct:+.2f}%)\n• Bei Take-Profit: {tp_pnl:+.2f} USDT ({tp_pct:+.2f}%)\n\n💰 <b>Accountbalance nach Verkauf:</b> {self.current_balance:,.2f} USDT\n\n⏱️ Zeit: {timestamp.strftime('%Y-%m-%d %H:%M:%S')}\n"""
+🔴 <b>POSITION GESCHLOSSEN: #{position['id']}</b>\n\n💰 <b>Trade Details:</b>\n• Einstiegskurs: ${position['entry_price']:,.2f}\n• Verkaufskurs: ${executed_price:,.2f}\n• Menge: {position['size']:.6f} BTC\n• Hebel: {position['leverage']:.1f}x\n\n📈 <b>Realisierter Gewinn/Verlust:</b>\n• PnL: ${pnl:,.2f} ({pnl_percentage:+.2f}%)\n• Gebühr Buy: ${buy_fee:.2f}\n• Gebühr Sell: ${sell_fee:.2f}\n• Netto PnL: ${pnl - buy_fee - sell_fee:,.2f}\n\n💰 <b>Accountbalance nach Verkauf:</b> {self.current_balance:,.2f} USDT\n\n⏱️ Zeit: {timestamp.strftime('%Y-%m-%d %H:%M:%S')}\n"""
         self.send_telegram_message(close_msg)
         self.logger.info(f"Position closed: PnL {pnl:.2f}, Fee Buy {buy_fee:.2f}, Fee Sell {sell_fee:.2f}")
         return pnl
@@ -1695,15 +1718,14 @@ Liquidations: {results['liquidated_positions']}
         if not self.is_live_trading:
             self.send_telegram_message("⚠️ Live Trading läuft nicht!")
             return
-        
         self.is_live_trading = False
-        
         # Close all open positions
         if self.positions:
             current_price = self.get_live_price()
             if current_price:
-                for position in self.positions[:]:  # Copy list to avoid modification during iteration
-                    self.close_position(position, current_price, datetime.now())
+                # Kopie der Liste, damit wir während der Iteration entfernen können
+                for position in self.positions[:]:
+                    self.close_position(position, current_price, datetime.now())  # Einzelmeldung wird in close_position verschickt
                     self.positions.remove(position)
 
         # Detaillierte Übersicht aller realisierten Trades mit Netto-PnL
@@ -1762,7 +1784,6 @@ Liquidations: {results['liquidated_positions']}
                     continue
                 self.current_price = price
                 timestamp = datetime.utcnow()
-
                 # Grid-Levels bestimmen
                 lower_grids = [g for g in self.grid_prices if g <= price]
                 upper_grids = [g for g in self.grid_prices if g >= price]
@@ -1770,7 +1791,6 @@ Liquidations: {results['liquidated_positions']}
                 next_upper = min(upper_grids) if upper_grids else None
                 dist_lower = price - next_lower if next_lower is not None else None
                 dist_upper = next_upper - price if next_upper is not None else None
-
                 grid_info = f"Aktueller Preis: {price:.2f} | "
                 if next_lower is not None:
                     grid_info += f"Nächstes unteres Grid: {next_lower:.2f} (Abstand: {dist_lower:.2f}) | "
@@ -1782,32 +1802,30 @@ Liquidations: {results['liquidated_positions']}
                     grid_info += "Kein oberes Grid"
                 print(grid_info)
                 self.logger.info(grid_info)
-
-                # Check for grid cross
-                trade_executed = False
-                for grid_price in self.grid_prices:
-                    if last_price is not None:
-                        crossed_up = last_price < grid_price <= price
-                        crossed_down = last_price > grid_price >= price
-                        has_long = any(p['side'] == 'long' for p in self.positions)
-                        has_short = any(p['side'] == 'short' for p in self.positions)
-                        if crossed_up and not has_long:
-                            self.execute_trade(grid_price, 'buy', timestamp)
-                            trade_executed = True
-                            break
-                        elif crossed_down and not has_short:
-                            # Statt execute_trade für 'sell' -> close_position für passende Long-Position
+                if self.reporting_mode == 'detailliert':
+                    msg = f"\U0001F4CA <b>Detailliertes Grid-Reporting</b>\n{grid_info}"
+                    self.send_telegram_message(msg)
+                # Korrigierte Grid-Logik: Nur beim echten Grid-Cross handeln
+                if last_price is not None:
+                    for grid_price in self.grid_prices:
+                        # Buy: Cross von oben nach unten
+                        if last_price > grid_price >= price:
+                            if not any(p['entry_price'] == grid_price and p['side'] == 'long' for p in self.positions):
+                                if len(self.positions) < self.max_open_positions:
+                                    self.execute_trade(grid_price, 'buy', timestamp)
+                        # Sell: Cross von unten nach oben
+                        elif last_price < grid_price <= price:
                             for position in self.positions:
-                                if position['side'] == 'long':
+                                if position['entry_price'] == grid_price and position['side'] == 'long':
                                     self.close_position(position, grid_price, timestamp)
                                     self.positions.remove(position)
-                                    trade_executed = True
                                     break
-                            if trade_executed:
-                                break
                 last_price = price
-                if not trade_executed:
-                    self.logger.info(f"No grid cross at price {price:.2f}.")
+                # Hinweise zur Fehlervermeidung:
+                # - Es wird nur beim echten Grid-Cross gehandelt, nicht bei jedem Loop.
+                # - Doppelte Orders auf einem Grid-Level werden verhindert.
+                # - max_open_positions wird weiterhin beachtet.
+                # - Die Logik ist robust gegen schnelle Kursbewegungen, solange last_price korrekt gesetzt wird.
                 time.sleep(30)  # Sleep 30 seconds between loops
             except Exception as e:
                 self.logger.error(f"Error in live_trading_loop: {e}")
@@ -1849,7 +1867,23 @@ Liquidations: {results['liquidated_positions']}
         self.total_fees = 0.0
         self.liquidated_positions = 0
         self.start_balance = self.current_balance
+        self.total_pnl = 0.0
+        self.funding_fees = 0.0
+        self.max_drawdown = 0.0
+        self.max_balance = self.current_balance
+        self.min_balance = self.current_balance
         self.send_telegram_message("✅ Statistikdaten wurden zurückgesetzt. Neuer Run beginnt jetzt.")
+
+    def cmd_reporting(self, chat_id: str, args: list):
+        """Schaltet zwischen normalem und detailliertem Reporting um."""
+        if args and args[0].lower() in ['detailliert', 'detailed', 'on']:
+            self.reporting_mode = 'detailliert'
+            self.send_telegram_message("📢 Detailliertes Reporting ist jetzt AKTIV. Bei jedem Kurscheck werden Grid-Infos gesendet.")
+        elif args and args[0].lower() in ['normal', 'off']:
+            self.reporting_mode = 'normal'
+            self.send_telegram_message("🔕 Detailliertes Reporting ist jetzt DEAKTIVIERT. Nur noch Benachrichtigungen bei Trades.")
+        else:
+            self.send_telegram_message(f"Aktueller Reporting-Modus: <b>{self.reporting_mode.upper()}</b>\nNutze /reporting detailliert oder /reporting normal zum Umschalten.")
 
 def main():
     """Main function to run the bot"""
