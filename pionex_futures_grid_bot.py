@@ -125,6 +125,7 @@ class PionexFuturesGridBot:
             "min_grid_pct_for_profit_check": 0.1,
             "min_grid_abs_warn": 130.0,
             "grid_count": 15,
+            "mode": "auto",  # Default immer auto, falls nicht gesetzt
             # Zusätzliche Parameter die in CONFIG_PARAMS referenziert werden
             "max_open_positions": 15,
             "trailing_stop_pct": 0.01,
@@ -170,7 +171,7 @@ class PionexFuturesGridBot:
                 "grid_upper_price": "auto",
                 "grid_count": 15,
                 "investment_amount": 1000.0,
-                "mode": "long",  # "long" or "short"
+                "mode": "auto",  # "auto", "long" oder "short"
                 "fee_rate": 0.0004,  # 0.04% per trade
                 "funding_rate": 0.0001,  # 0.01% per 8 hours
                 "liquidation_buffer": 0.1,  # 10% buffer before liquidation
@@ -457,6 +458,18 @@ class PionexFuturesGridBot:
                         self.send_telegram_message("Fehler beim Senden der Excel-Datei.")
                 else:
                     self.send_telegram_message("Keine Trades zum Exportieren vorhanden.")
+            elif cmd in ['/mode.auto', '/mode.auto', '/mode', '/mode.auto'] or (cmd == '/mode' and args and args[0].lower() == 'auto'):
+                self.config['mode'] = 'auto'
+                self.send_telegram_message('🔄 Modus auf AUTO gestellt. Der Bot entscheidet automatisch Long/Short nach Trend.')
+                return
+            elif cmd in ['/mode.long', '/mode.long'] or (cmd == '/mode' and args and args[0].lower() == 'long'):
+                self.config['mode'] = 'long'
+                self.send_telegram_message('🔄 Modus auf LONG gestellt. Es werden nur Long-Trades ausgeführt.')
+                return
+            elif cmd in ['/mode.short', '/mode.short'] or (cmd == '/mode' and args and args[0].lower() == 'short'):
+                self.config['mode'] = 'short'
+                self.send_telegram_message('🔄 Modus auf SHORT gestellt. Es werden nur Short-Trades ausgeführt.')
+                return
             else:
                 self.send_telegram_message(f"❌ Unbekannter Befehl: {cmd}\nVerwende /help für verfügbare Befehle")
                 
@@ -520,6 +533,7 @@ class PionexFuturesGridBot:
                 f"\U0001F4BC Wert offene Positionen: <b>{value_positions:.2f} USDT</b>\n"
                 f"\U0001F512 Gebundene Margin: <b>{margin_sum:.2f} USDT</b>\n"
                 f"\U0001F4CA Unrealized PnL: <b>{unrealized_pnl:+.2f} USDT</b>\n"
+                f"\U0001F4DD Modus: <b>{self.config.get('mode','long').upper()}</b>\n"
             )
             if self.current_price:
                 status_msg += f"\U0001F4B1 Aktueller Preis: <b>{self.current_price:.2f} USDT</b>\n\n"
@@ -910,6 +924,10 @@ class PionexFuturesGridBot:
         help_msg += "/config - Konfiguration\n"
         help_msg += "/liquidate.preview - Vorschau bei sofortigem Schließen\n"
         help_msg += "/export.performance - Exportiert alle Trades als Excel-Datei und sendet sie per Telegram\n\n"
+        help_msg += "Modus-Steuerung:\n"
+        help_msg += "/mode.auto - Auto-Modus (Bot entscheidet Long/Short nach Trend)\n"
+        help_msg += "/mode.long - Nur Long-Trades\n"
+        help_msg += "/mode.short - Nur Short-Trades\n\n"
         help_msg += "Debugging:\n"
         help_msg += "/debug.on - Debug aktivieren\n"
         help_msg += "/logs.recent - Letzte Logs\n"
@@ -1916,6 +1934,14 @@ Liquidations: {results['liquidated_positions']}
                     continue
                 self.current_price = price
                 timestamp = datetime.utcnow()
+                # Trend für Auto-Modus bestimmen (auf Basis der letzten 100 1m-Kerzen)
+                trend = None
+                if self.config.get('mode', 'long') == 'auto':
+                    klines = self.get_live_klines(100)
+                    if klines is not None and len(klines) > 50:
+                        # Technische Indikatoren berechnen
+                        klines = self.add_technical_indicators(klines)
+                        trend = self.detect_trend(klines, len(klines)-1)
                 # Grid-Levels bestimmen
                 lower_grids = [g for g in self.grid_prices if g <= price]
                 upper_grids = [g for g in self.grid_prices if g >= price]
@@ -1943,12 +1969,9 @@ Liquidations: {results['liquidated_positions']}
                         grid_abs = abs(grid_price - price)
                         # Buy: Cross von oben nach unten
                         if last_price > grid_price >= price:
-                            # Profitabilitätsprüfung
                             grid_pct = abs(grid_price - price) / price * 100
                             check_profit = self.config.get('enable_profitability_check', True)
                             min_grid_pct = self.config.get('min_grid_pct_for_profit_check', 0.1)
-                            auto_deactivated = False
-                            auto_activated = False
                             if grid_pct < min_grid_pct:
                                 if last_profit_check_state is not False:
                                     self.send_telegram_message("⚠️ Die Profitabilitätsprüfung wurde wegen sehr kleinem Grid (< min_grid_pct) automatisch DEAKTIVIERT!")
@@ -1959,31 +1982,44 @@ Liquidations: {results['liquidated_positions']}
                                     self.send_telegram_message("ℹ️ Die Profitabilitätsprüfung ist wieder AKTIV, da das Grid ausreichend groß ist.")
                                 last_profit_check_state = True
                             is_profitable = True
-                            if check_profit:
-                                # Berechne erwarteten Netto-Gewinn für Grid-Sell
+                            # --- AUTO-MODUS: Trend-Entscheidung ---
+                            mode = self.config.get('mode', 'long')
+                            trade_side = None
+                            if mode == 'auto':
+                                if trend == 'bullish':
+                                    trade_side = 'buy'
+                                elif trend == 'bearish':
+                                    trade_side = 'sell'
+                                else:
+                                    trade_side = None  # neutral: kein Trade
+                            elif mode == 'long':
+                                trade_side = 'buy'
+                            elif mode == 'short':
+                                trade_side = 'sell'
+                            if trade_side and check_profit:
+                                # Berechne erwarteten Netto-Gewinn für Grid-Sell/Buy
                                 position_size = self.calculate_position_size(grid_price)
                                 fee_rate = self.config['fee_rate']
                                 buy_fee = position_size * grid_price * fee_rate
                                 sell_fee_grid = position_size * grid_price * fee_rate
-                                grid_sell_pnl = ((grid_price - price) * position_size * self.config['leverage']) - buy_fee - sell_fee_grid
-                                is_profitable = grid_sell_pnl > 0
-                            if is_profitable and not any(p['entry_price'] == grid_price and p['side'] == 'long' for p in self.positions):
-                                if len(self.positions) < self.max_open_positions:
-                                    self.execute_trade(grid_price, 'buy', timestamp)
+                                if trade_side == 'buy':
+                                    grid_sell_pnl = ((grid_price - price) * position_size * self.config['leverage']) - buy_fee - sell_fee_grid
+                                    is_profitable = grid_sell_pnl > 0
+                                else:  # sell/short
+                                    grid_buy_pnl = ((price - grid_price) * position_size * self.config['leverage']) - buy_fee - sell_fee_grid
+                                    is_profitable = grid_buy_pnl > 0
+                                if is_profitable and not any(p['entry_price'] == grid_price and p['side'] == ('long' if trade_side == 'buy' else 'short') for p in self.positions):
+                                    if len(self.positions) < self.max_open_positions:
+                                        self.execute_trade(grid_price, trade_side, timestamp)
                         # Sell: Cross von unten nach oben
                         elif last_price < grid_price <= price:
                             for position in self.positions:
-                                if position['entry_price'] == grid_price and position['side'] == 'long':
+                                if position['entry_price'] == grid_price and ((self.config.get('mode', 'long') == 'short' and position['side'] == 'short') or (self.config.get('mode', 'long') == 'long' and position['side'] == 'long') or (self.config.get('mode', 'long') == 'auto')):
                                     self.close_position(position, grid_price, timestamp)
                                     self.positions.remove(position)
                                     break
                 last_price = price
-                # Hinweise zur Fehlervermeidung:
-                # - Es wird nur beim echten Grid-Cross gehandelt, nicht bei jedem Loop.
-                # - Doppelte Orders auf einem Grid-Level werden verhindert.
-                # - max_open_positions wird weiterhin beachtet.
-                # - Die Logik ist robust gegen schnelle Kursbewegungen, solange last_price korrekt gesetzt wird.
-                time.sleep(30)  # Sleep 30 seconds between loops
+                time.sleep(30)
             except Exception as e:
                 self.logger.error(f"Error in live_trading_loop: {e}")
                 time.sleep(30)
