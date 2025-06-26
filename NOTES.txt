@@ -19,3 +19,8 @@ git pull
 ./deploy.sh
 
 
+Bot im Hintergrund laufen lassen, damit PC ausgeschaltete werden kann
+screen -S pionex-bot
+python3 run_pionex_bot.py
+--> Mit Strg+A, dann D trennst du die Session (der Bot läuft weiter).
+--> Mit screen -r pionex-bot kannst du später wieder „reinschauen“.
