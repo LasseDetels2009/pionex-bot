@@ -13,6 +13,7 @@ import threading
 import traceback
 import sys
 from flask import Flask, request, jsonify
+import openpyxl
 
 class PionexFuturesGridBot:
     """
@@ -117,10 +118,25 @@ class PionexFuturesGridBot:
         self.reporting_mode = 'normal'  # 'normal' oder 'detailliert'
     
     def ensure_config_defaults(self):
+        """Ensure all config parameters have default values"""
         defaults = {
+            # Neue Parameter
             "enable_profitability_check": True,
             "min_grid_pct_for_profit_check": 0.1,
-            "min_grid_abs_warn": 130.0
+            "min_grid_abs_warn": 130.0,
+            "grid_count": 15,
+            # Zusätzliche Parameter die in CONFIG_PARAMS referenziert werden
+            "max_open_positions": 15,
+            "trailing_stop_pct": 0.01,
+            "adaptive_grid_enabled": True,
+            "dynamic_leverage_enabled": True,
+            "risk_management_enabled": True,
+            "live_trading_duration_minutes": 1440,  # 24 Stunden
+            "live_trading_interval_seconds": 30,
+            # Fallback für fehlende Parameter
+            "report_interval": 10,
+            "save_interval": 15,
+            "live_trading_enabled": False
         }
         for k, v in defaults.items():
             if k not in self.config:
@@ -152,7 +168,7 @@ class PionexFuturesGridBot:
                 "leverage": 3,
                 "grid_lower_price": "auto",
                 "grid_upper_price": "auto",
-                "grid_count": 20,
+                "grid_count": 15,
                 "investment_amount": 1000.0,
                 "mode": "long",  # "long" or "short"
                 "fee_rate": 0.0004,  # 0.04% per trade
@@ -165,7 +181,19 @@ class PionexFuturesGridBot:
                 "telegram_chat_id": "YOUR_CHAT_ID",
                 "report_interval": 10,  # Report every N tests
                 "save_interval": 15,  # Save every N minutes
-                "live_trading_enabled": False
+                "live_trading_enabled": False,
+                
+                # Neue Parameter
+                "max_open_positions": 15,
+                "trailing_stop_pct": 0.01,
+                "adaptive_grid_enabled": True,
+                "dynamic_leverage_enabled": True,
+                "risk_management_enabled": True,
+                "live_trading_duration_minutes": 1440,  # 24 Stunden
+                "live_trading_interval_seconds": 30,
+                "enable_profitability_check": True,
+                "min_grid_pct_for_profit_check": 0.1,
+                "min_grid_abs_warn": 130.0
             }
             
             with open(config_file, 'w', encoding='utf-8') as f:
@@ -328,8 +356,26 @@ class PionexFuturesGridBot:
         """Process Telegram bot commands"""
         try:
             cmd_parts = command.split()
-            cmd = cmd_parts[0].lower()
+            cmd = cmd_parts[0].lower().replace('_', '.').replace('/', '/').strip()
             args = cmd_parts[1:] if len(cmd_parts) > 1 else []
+            
+            # Mapping für Punkt- und Unterstrich-Befehle
+            cmd_map = {
+                '/reset.stats': '/reset_stats',
+                '/reporting.normal': '/reporting_normal',
+                '/reporting.detailliert': '/reporting_detailliert',
+                '/set': '/set',
+                '/paraminfo': '/paraminfo',
+                '/export.performance': '/export.performance',
+                '/liquidate.preview': '/liquidate_preview',
+                '/close.preview': '/close_preview',
+                '/debug.on': '/debug on',
+                '/logs.recent': '/logs recent',
+                '/debug.info': '/debug info',
+            }
+            # Ersetze Punkt-Befehle durch Unterstrich-Variante für die Logik
+            if cmd in cmd_map:
+                cmd = cmd_map[cmd]
             
             if cmd == '/start':
                 self.cmd_start(chat_id)
@@ -376,6 +422,7 @@ class PionexFuturesGridBot:
                     num = int(num)
                     if num in self.CONFIG_PARAMS:
                         key, _ = self.CONFIG_PARAMS[num]
+                        old_val = self.config.get(key, None)
                         # Typkonvertierung
                         if isinstance(self.config.get(key, None), bool):
                             self.config[key] = bool(int(val))
@@ -386,16 +433,30 @@ class PionexFuturesGridBot:
                         else:
                             self.config[key] = val
                         self.send_telegram_message(f"Parameter {num} ({key}) wurde auf {val} gesetzt.")
+                        # Profitabilitätsprüfung Warnung
+                        if key == "enable_profitability_check":
+                            if not self.config[key] and old_val:
+                                self.send_telegram_message("⚠️ Die Profitabilitätsprüfung wurde AUSGESCHALTET!")
+                            elif self.config[key] and not old_val:
+                                self.send_telegram_message("ℹ️ Die Profitabilitätsprüfung wurde wieder EINGESCHALTET.")
                     else:
                         self.send_telegram_message(f"Unbekannte Parameternummer: {num}")
                 except Exception as e:
                     self.send_telegram_message(f"Fehler beim Setzen: {e}")
             elif cmd == '/paraminfo':
-                msg = "<b>Konfigurierbare Parameter:</b>\n"
+                param_msg = "Verfügbare Parameter für /set:\n"
                 for num, (key, desc) in self.CONFIG_PARAMS.items():
-                    val = self.config.get(key, 'n/a')
-                    msg += f"{num}: {key} = {val}  // {desc}\n"
-                self.send_telegram_message(msg)
+                    param_msg += f"{num}: {key}  // {desc}\n"
+                self.send_telegram_message(param_msg, force_plaintext=True)
+                return
+            elif cmd == '/export.performance':
+                if self.export_performance_to_excel():
+                    if self.send_excel_via_telegram(chat_id):
+                        self.send_telegram_message("Excel-Export wurde gesendet.")
+                    else:
+                        self.send_telegram_message("Fehler beim Senden der Excel-Datei.")
+                else:
+                    self.send_telegram_message("Keine Trades zum Exportieren vorhanden.")
             else:
                 self.send_telegram_message(f"❌ Unbekannter Befehl: {cmd}\nVerwende /help für verfügbare Befehle")
                 
@@ -834,50 +895,47 @@ class PionexFuturesGridBot:
     
     def cmd_help(self, chat_id: str):
         """Help command"""
-        help_msg = "🤖 **Pionex Futures Grid Bot - Hilfe**\n\n"
-        help_msg += "**Grundbefehle:**\n"
+        help_msg = "Pionex Futures Grid Bot - Hilfe\n\n"
+        help_msg += "Grundbefehle:\n"
         help_msg += "/start - Bot starten\n"
         help_msg += "/stop - Bot stoppen\n"
         help_msg += "/status - Aktueller Status\n"
         help_msg += "/statustag - Tagesperformance\n"
         help_msg += "/statuswoche - Wochenperformance\n"
         help_msg += "/restart - Bot neu starten\n\n"
-        
-        help_msg += "**Informationen:**\n"
+        help_msg += "Informationen:\n"
         help_msg += "/balance - Kontostand\n"
         help_msg += "/positions - Offene Positionen\n"
         help_msg += "/trades - Letzte Trades\n"
         help_msg += "/config - Konfiguration\n"
-        help_msg += "/liquidate_preview - Vorschau bei sofortigem Schließen\n\n"
-        
-        help_msg += "**Debugging:**\n"
-        help_msg += "/debug - Debug-Befehle\n"
-        help_msg += "/logs - Log-Befehle\n"
-        help_msg += "/help - Diese Hilfe\n\n"
-        
-        help_msg += "**Beispiele:**\n"
-        help_msg += "/debug on - Debug aktivieren\n"
-        help_msg += "/logs recent - Letzte Logs\n"
-        help_msg += "/debug info - System-Info"
-        help_msg += "/reset_stats - Setzt alle Statistiken zurück (z.B. nach Bot-Neustart)\n"
-        help_msg += "/reporting_normal - Normales Reporting (nur Trades)\n"
-        help_msg += "/reporting_detailliert - Detailliertes Reporting (Grid-Infos bei jedem Kurscheck)\n"
+        help_msg += "/liquidate.preview - Vorschau bei sofortigem Schließen\n"
+        help_msg += "/export.performance - Exportiert alle Trades als Excel-Datei und sendet sie per Telegram\n\n"
+        help_msg += "Debugging:\n"
+        help_msg += "/debug.on - Debug aktivieren\n"
+        help_msg += "/logs.recent - Letzte Logs\n"
+        help_msg += "/debug.info - System-Info\n"
+        help_msg += "/reset.stats - Setzt alle Statistiken zurück (z.B. nach Bot-Neustart)\n"
+        help_msg += "/reporting.normal - Normales Reporting (nur Trades)\n"
+        help_msg += "/reporting.detailliert - Detailliertes Reporting (Grid-Infos bei jedem Kurscheck)\n"
         help_msg += "/version - Zeigt das Datum des letzten Bot-Updates (Codeänderung)\n"
-        
-        help_msg += "/set <Nummer>:<Wert> - Setzt einen Parameter live\n"
-        help_msg += "/paraminfo - Zeigt alle konfigurierbaren Parameter mit Erklärung\n"
-        
-        self.send_telegram_message(help_msg)
-
-    def send_telegram_message(self, message: str):
+        help_msg += "/set <Nummer>:<Wert> - Setzt einen Parameter live, z.B. /set 21:0\n"
+        help_msg += "/paraminfo - Zeigt alle konfigurierbaren Parameter mit Erklärung\n\n"
+        help_msg += "Parameter-Nummern und Erklärungen erhältst du mit /paraminfo.\n"
+        # Telegram Limit: 4096 Zeichen, wir nehmen 3500 als Sicherheit
+        max_len = 3500
+        for i in range(0, len(help_msg), max_len):
+            self.send_telegram_message(help_msg[i:i+max_len], force_plaintext=True)
+    
+    def send_telegram_message(self, message: str, force_plaintext: bool = False):
         """Send message via Telegram (emojis allowed here)"""
         try:
             if self.telegram_token != "YOUR_TELEGRAM_TOKEN":
                 payload = {
                     'chat_id': self.telegram_chat_id,
-                    'text': message,
-                    'parse_mode': 'HTML'
+                    'text': message
                 }
+                if not force_plaintext:
+                    payload['parse_mode'] = 'HTML'
                 response = requests.post(self.telegram_url, data=payload, timeout=10)
                 if response.status_code != 200:
                     self.logger.warning(f"Telegram message failed: {response.text}")
@@ -1017,6 +1075,8 @@ class PionexFuturesGridBot:
         lower_price = float(self.config['grid_lower_price'])
         upper_price = float(self.config['grid_upper_price'])
         grid_count = self.config['grid_count']
+        if grid_count < 2:
+            grid_count = 2
         grid_spacing = (upper_price - lower_price) / (grid_count - 1)
         grid_prices = [lower_price + i * grid_spacing for i in range(grid_count)]
         self.logger.info(f"Grid prices: {len(grid_prices)} levels from {lower_price:.2f} to {upper_price:.2f}")
@@ -1846,6 +1906,7 @@ Liquidations: {results['liquidated_positions']}
         """Main loop for live trading. Only trade on grid cross, sleep between loops."""
         self.logger.info("Live trading loop started.")
         last_price = None
+        last_profit_check_state = None  # Track last state for info
         while self.is_live_trading:
             try:
                 price = self.get_live_price()
@@ -1880,18 +1941,23 @@ Liquidations: {results['liquidated_positions']}
                 if last_price is not None:
                     for grid_price in self.grid_prices:
                         grid_abs = abs(grid_price - price)
-                        # Warnung bei zu kleinem Grid-Abstand
-                        if grid_abs < self.config.get('min_grid_abs_warn', 130.0):
-                            warn_level = self.config.get('min_grid_abs_warn', 130.0)
-                            self.send_telegram_message(f"⚠️ Warnung: Grid-Abstand {grid_abs:.2f} USDT ist kleiner als {warn_level:.2f} USDT!")
                         # Buy: Cross von oben nach unten
                         if last_price > grid_price >= price:
                             # Profitabilitätsprüfung
                             grid_pct = abs(grid_price - price) / price * 100
                             check_profit = self.config.get('enable_profitability_check', True)
                             min_grid_pct = self.config.get('min_grid_pct_for_profit_check', 0.1)
+                            auto_deactivated = False
+                            auto_activated = False
                             if grid_pct < min_grid_pct:
+                                if last_profit_check_state is not False:
+                                    self.send_telegram_message("⚠️ Die Profitabilitätsprüfung wurde wegen sehr kleinem Grid (< min_grid_pct) automatisch DEAKTIVIERT!")
                                 check_profit = False
+                                last_profit_check_state = False
+                            else:
+                                if last_profit_check_state is not True:
+                                    self.send_telegram_message("ℹ️ Die Profitabilitätsprüfung ist wieder AKTIV, da das Grid ausreichend groß ist.")
+                                last_profit_check_state = True
                             is_profitable = True
                             if check_profit:
                                 # Berechne erwarteten Netto-Gewinn für Grid-Sell
@@ -1995,6 +2061,22 @@ Liquidations: {results['liquidated_positions']}
         except Exception as e:
             msg += f"❌ Fehler beim Versions-Check: {e}"
         self.send_telegram_message(msg)
+
+    def export_performance_to_excel(self, filename='performance_report.xlsx'):
+        """Exportiert alle Trades als Excel-Datei"""
+        if not self.trades:
+            return False
+        df = pd.DataFrame(self.trades)
+        df.to_excel(filename, index=False)
+        return True
+
+    def send_excel_via_telegram(self, chat_id, filename='performance_report.xlsx'):
+        url = f"https://api.telegram.org/bot{self.telegram_token}/sendDocument"
+        with open(filename, 'rb') as f:
+            files = {'document': f}
+            data = {'chat_id': chat_id}
+            response = requests.post(url, files=files, data=data)
+        return response.status_code == 200
 
 def main():
     """Main function to run the bot"""
