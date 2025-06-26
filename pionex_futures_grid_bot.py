@@ -49,9 +49,8 @@ class PionexFuturesGridBot:
         21: ("enable_profitability_check", "Profitabilitätsprüfung aktiv (1=ja,0=nein)"),
         22: ("min_grid_pct_for_profit_check", "Min. Grid-% für Profit-Check (z.B. 0.1)"),
         23: ("min_grid_abs_warn", "Warnung bei Grid-Abstand < X USDT (z.B. 130)"),
-        24: ("grid_mode", "Grid-Modus: auto/statisch"),
-        25: ("grid_lower_price", "Untere Grid-Grenze (USDT oder 'auto')"),
-        26: ("grid_upper_price", "Obere Grid-Grenze (USDT oder 'auto')"),
+        24: ("grid_mode", "Grid-Modus: auto/static"),
+        25: ("grid_size", "Gridspacing (USDT)"),
     }
     
     def __init__(self, config_file: str = "pionex_config.json"):
@@ -141,7 +140,9 @@ class PionexFuturesGridBot:
             # Fallback für fehlende Parameter
             "report_interval": 10,
             "save_interval": 15,
-            "live_trading_enabled": False
+            "live_trading_enabled": False,
+            "grid_mode": "auto",
+            "grid_size": None,
         }
         for k, v in defaults.items():
             if k not in self.config:
@@ -198,7 +199,9 @@ class PionexFuturesGridBot:
                 "live_trading_interval_seconds": 30,
                 "enable_profitability_check": True,
                 "min_grid_pct_for_profit_check": 0.1,
-                "min_grid_abs_warn": 130.0
+                "min_grid_abs_warn": 130.0,
+                "grid_mode": "auto",
+                "grid_size": None,
             }
             
             with open(config_file, 'w', encoding='utf-8') as f:
@@ -363,7 +366,7 @@ class PionexFuturesGridBot:
             cmd_parts = command.split()
             cmd = cmd_parts[0].lower().replace('_', '.').replace('/', '/').strip()
             args = cmd_parts[1:] if len(cmd_parts) > 1 else []
-            
+
             # Mapping für Punkt- und Unterstrich-Befehle
             cmd_map = {
                 '/reset.stats': '/reset_stats',
@@ -377,11 +380,16 @@ class PionexFuturesGridBot:
                 '/debug.on': '/debug on',
                 '/logs.recent': '/logs recent',
                 '/debug.info': '/debug info',
+                '/all': '/all',
             }
-            # Ersetze Punkt-Befehle durch Unterstrich-Variante für die Logik
             if cmd in cmd_map:
                 cmd = cmd_map[cmd]
-            
+
+            # /all immer ganz oben prüfen
+            if cmd == '/all':
+                self.cmd_all(chat_id)
+                return
+
             if cmd == '/start':
                 self.cmd_start(chat_id)
             elif cmd == '/stop':
@@ -421,11 +429,34 @@ class PionexFuturesGridBot:
             elif cmd == '/version':
                 self.cmd_version(chat_id)
             elif cmd == '/set' and args:
-                # /set Nummer:Wert
                 try:
-                    num, val = args[0].split(':')
-                    num = int(num)
-                    if num in self.CONFIG_PARAMS:
+                    # Robust: Entferne alle Leerzeichen um Nummer und Wert
+                    num_val = args[0].replace(' ', '')
+                    num, val = num_val.split(':')
+                    num = int(num.strip())
+                    val = val.strip()
+                    if num == 25:
+                        grid_size = float(val)
+                        self.config['grid_size'] = grid_size
+                        self.config['grid_mode'] = 'static'
+                        self.grid_prices = self.calculate_grid_prices()
+                        self.send_telegram_message(f"Gridspacing wurde auf {grid_size} USDT gesetzt. Grid ist jetzt statisch.")
+                        self.send_telegram_message(f"Neues Grid: {self.config['grid_count']} x {grid_size} USDT von {self.config['grid_lower_price']:.2f} bis {self.config['grid_upper_price']:.2f}")
+                        return
+                    elif num == 3:
+                        grid_count = int(val)
+                        self.config['grid_count'] = grid_count
+                        self.grid_prices = self.calculate_grid_prices()
+                        self.send_telegram_message(f"Grid-Anzahl wurde auf {grid_count} gesetzt. Grid wurde neu berechnet.")
+                        self.send_telegram_message(f"Neues Grid: {grid_count} x {self.config.get('grid_size','auto')} USDT von {self.config['grid_lower_price']:.2f} bis {self.config['grid_upper_price']:.2f}")
+                        return
+                    elif num == 24 and val.lower() == 'auto':
+                        self.config['grid_mode'] = 'auto'
+                        self.config['grid_size'] = None
+                        self.grid_prices = self.calculate_grid_prices()
+                        self.send_telegram_message('Grid-Modus wieder auf AUTO gestellt. Grid wird automatisch berechnet.')
+                        return
+                    elif num in self.CONFIG_PARAMS:
                         key, _ = self.CONFIG_PARAMS[num]
                         old_val = self.config.get(key, None)
                         # Typkonvertierung
@@ -438,16 +469,11 @@ class PionexFuturesGridBot:
                         else:
                             self.config[key] = val
                         self.send_telegram_message(f"Parameter {num} ({key}) wurde auf {val} gesetzt.")
-                        # Profitabilitätsprüfung Warnung
-                        if key == "enable_profitability_check":
-                            if not self.config[key] and old_val:
-                                self.send_telegram_message("⚠️ Die Profitabilitätsprüfung wurde AUSGESCHALTET!")
-                            elif self.config[key] and not old_val:
-                                self.send_telegram_message("ℹ️ Die Profitabilitätsprüfung wurde wieder EINGESCHALTET.")
                     else:
                         self.send_telegram_message(f"Unbekannte Parameternummer: {num}")
                 except Exception as e:
                     self.send_telegram_message(f"Fehler beim Setzen: {e}")
+                return
             elif cmd == '/paraminfo':
                 param_msg = "Verfügbare Parameter für /set:\n"
                 for num, (key, desc) in self.CONFIG_PARAMS.items():
@@ -474,6 +500,27 @@ class PionexFuturesGridBot:
                 self.config['mode'] = 'short'
                 self.send_telegram_message('🔄 Modus auf SHORT gestellt. Es werden nur Short-Trades ausgeführt.')
                 return
+            elif cmd == '/set' and args:
+                if args[0].lower().startswith('gridspacing'):
+                    try:
+                        _, val = args[0].split('gridspacing')
+                        val = val.strip(':= ')
+                        grid_size = float(val)
+                        self.config['grid_size'] = grid_size
+                        self.config['grid_mode'] = 'static'
+                        self.grid_prices = self.calculate_grid_prices()
+                        self.send_telegram_message(f"Gridspacing wurde auf {grid_size} USDT gesetzt. Grid ist jetzt statisch.")
+                        self.send_telegram_message(f"Neues Grid: {self.config['grid_count']} x {grid_size} USDT von {self.config['grid_lower_price']:.2f} bis {self.config['grid_upper_price']:.2f}")
+                    except Exception as e:
+                        self.send_telegram_message(f"Fehler beim Setzen von gridspacing: {e}")
+                    return
+                # /set 24:auto schaltet auf Automatik
+                if args[0].startswith('24:') and 'auto' in args[0]:
+                    self.config['grid_mode'] = 'auto'
+                    self.config['grid_size'] = None
+                    self.send_telegram_message('Grid-Modus wieder auf AUTO gestellt. Grid wird automatisch berechnet.')
+                    self.grid_prices = self.calculate_grid_prices()
+                    return
             else:
                 self.send_telegram_message(f"❌ Unbekannter Befehl: {cmd}\nVerwende /help für verfügbare Befehle")
                 
@@ -760,14 +807,24 @@ class PionexFuturesGridBot:
         try:
             config_msg = "⚙️ **Aktuelle Konfiguration**\n\n"
             config_msg += f"Modus: {self.config['mode']}\n"
-            config_msg += f"Hebel: {self.config['leverage']}x\n"
+            config_msg += f"Grid-Modus: {self.config.get('grid_mode','auto')}\n"
             config_msg += f"Grid-Anzahl: {self.config['grid_count']}\n"
+            config_msg += f"Gridspacing: {self.config.get('grid_size','auto')} USDT\n"
+            config_msg += f"Grid-Bereich: {self.config.get('grid_lower_price','auto'):.2f} - {self.config.get('grid_upper_price','auto'):.2f} USDT\n"
+            if self.config.get('grid_mode','auto') == 'static' and self.config.get('grid_size'):
+                config_msg += f"Grid-Abstand: {self.config['grid_size']} USDT (statisch)\n"
+            else:
+                grid_count = self.config['grid_count']
+                lower = float(self.config['grid_lower_price'])
+                upper = float(self.config['grid_upper_price'])
+                grid_spacing = (upper - lower) / (grid_count-1) if grid_count > 1 else 0
+                config_msg += f"Grid-Abstand: {grid_spacing:.2f} USDT (auto)\n"
             config_msg += f"Investment: {self.config['investment_amount']} USDT\n"
+            config_msg += f"Hebel: {self.config['leverage']}x\n"
             config_msg += f"Gebühren: {self.config['fee_rate']*100:.3f}%\n"
             config_msg += f"Stop-Loss: {self.config['stop_loss_pct']*100:.1f}%\n"
             config_msg += f"Take-Profit: {self.config['take_profit_pct']*100:.1f}%\n"
             config_msg += f"Live Trading: {'Aktiv' if self.config.get('live_trading_enabled') else 'Inaktiv'}\n"
-            
             self.send_telegram_message(config_msg)
         except Exception as e:
             self.send_telegram_message(f"❌ Fehler beim Config: {str(e)}")
@@ -1053,56 +1110,84 @@ class PionexFuturesGridBot:
         return data
     
     def auto_set_grid_range(self):
-        """Auto-set grid range based on current market conditions"""
+        """Auto-set grid range based on current market conditions, mit Anpassung für Seitwärtsphasen und dynamischem Investment"""
         try:
             if hasattr(self, 'data') and self.data is not None:
-                # Use historical data for backtest mode
                 closes = self.data['close'].astype(float)
                 current_price = closes.iloc[-1]
                 volatility = closes.pct_change().std()
             else:
-                # Use live data for live trading mode
                 current_price = self.get_live_price()
                 if current_price is None:
-                    current_price = 50000  # Fallback price
-                
-                # Get recent klines for volatility calculation
+                    current_price = 50000
                 klines = self.get_live_klines(100)
                 if klines is not None and len(klines) > 0:
                     closes = klines['close'].astype(float)
                     volatility = closes.pct_change().std()
                 else:
-                    volatility = 0.02  # Default volatility
-            
-            # Calculate grid range based on volatility
-            grid_range_pct = max(0.05, min(0.20, volatility * 10))  # 5-20% range
+                    volatility = 0.02
+
+            # Anpassung für sehr niedrige Volatilität (Seitwärtsmarkt)
+            if volatility < 0.005:
+                grid_count = self.config.get('grid_count', 20)
+                orig_grid_spacing = (self.config['grid_upper_price'] - self.config['grid_lower_price']) / (grid_count-1) if self.config.get('grid_upper_price') and self.config.get('grid_lower_price') and grid_count > 1 else 100
+                grid_spacing = max(10, current_price * 0.0001)  # min. 10 USDT oder 0.01%
+                lower = current_price - grid_spacing * ((grid_count-1)/2)
+                upper = current_price + grid_spacing * ((grid_count-1)/2)
+                self.config['grid_lower_price'] = lower
+                self.config['grid_upper_price'] = upper
+                # Dynamische Anpassung des Investments
+                orig_investment = self.config.get('_orig_investment_amount', self.config['investment_amount'])
+                if '_orig_investment_amount' not in self.config:
+                    self.config['_orig_investment_amount'] = orig_investment
+                new_investment = max(10, orig_investment * (grid_spacing / orig_grid_spacing))
+                self.config['investment_amount'] = new_investment
+                self.logger.info(f"Seitwärtsmarkt erkannt: Gridspacing auf {grid_spacing:.2f} USDT, Investment pro Grid auf {new_investment:.2f} USDT angepasst.")
+                self.send_telegram_message(f"⚡️ Sehr niedrige Volatilität erkannt! Gridspacing automatisch auf {grid_spacing:.2f} USDT gesetzt und Investment pro Grid auf {new_investment:.2f} USDT reduziert.")
+                return
+
+            # Standard-Logik
+            grid_range_pct = max(0.05, min(0.20, volatility * 10))
             grid_range = current_price * grid_range_pct
-            
             self.config['grid_lower_price'] = current_price - grid_range / 2
             self.config['grid_upper_price'] = current_price + grid_range / 2
-            
+            # Bei Rückkehr zu normalem Grid: Investment zurücksetzen
+            if '_orig_investment_amount' in self.config:
+                self.config['investment_amount'] = self.config['_orig_investment_amount']
             self.logger.info(f"Auto-set grid range: {self.config['grid_lower_price']:.2f} - {self.config['grid_upper_price']:.2f}")
-            
         except Exception as e:
             self.logger.error(f"Error in auto_set_grid_range: {e}")
-            # Fallback to default range
             current_price = self.get_live_price() or 50000
             self.config['grid_lower_price'] = current_price * 0.95
             self.config['grid_upper_price'] = current_price * 1.05
     
     def calculate_grid_prices(self) -> list:
-        """Calculate grid price levels"""
-        # Automatische Grid-Bereich-Ermittlung falls nötig
-        self.auto_set_grid_range()
-        lower_price = float(self.config['grid_lower_price'])
-        upper_price = float(self.config['grid_upper_price'])
-        grid_count = self.config['grid_count']
-        if grid_count < 2:
-            grid_count = 2
-        grid_spacing = (upper_price - lower_price) / (grid_count - 1)
-        grid_prices = [lower_price + i * grid_spacing for i in range(grid_count)]
-        self.logger.info(f"Grid prices: {len(grid_prices)} levels from {lower_price:.2f} to {upper_price:.2f}")
-        return grid_prices
+        if self.config.get("grid_mode", "auto") == "static" and self.config.get("grid_size"):
+            grid_count = self.config["grid_count"]
+            grid_size = float(self.config["grid_size"])
+            # Aktueller Preis als Mittelpunkt
+            if self.current_price:
+                center = self.current_price
+            else:
+                center = self.get_live_price() or 50000
+            lower = center - grid_size * ((grid_count-1)/2)
+            upper = center + grid_size * ((grid_count-1)/2)
+            self.config["grid_lower_price"] = lower
+            self.config["grid_upper_price"] = upper
+            grid_prices = [lower + i*grid_size for i in range(grid_count)]
+            self.logger.info(f"Static grid: {grid_count} x {grid_size} USDT von {lower:.2f} bis {upper:.2f}")
+            return grid_prices
+        else:
+            self.auto_set_grid_range()
+            lower_price = float(self.config['grid_lower_price'])
+            upper_price = float(self.config['grid_upper_price'])
+            grid_count = self.config['grid_count']
+            if grid_count < 2:
+                grid_count = 2
+            grid_spacing = (upper_price - lower_price) / (grid_count - 1)
+            grid_prices = [lower_price + i * grid_spacing for i in range(grid_count)]
+            self.logger.info(f"Grid prices: {len(grid_prices)} levels from {lower_price:.2f} to {upper_price:.2f}")
+            return grid_prices
     
     def calculate_position_size(self, price: float) -> float:
         """Calculate position size based on investment amount and leverage"""
@@ -2117,6 +2202,39 @@ Liquidations: {results['liquidated_positions']}
             data = {'chat_id': chat_id}
             response = requests.post(url, files=files, data=data)
         return response.status_code == 200
+
+    def cmd_all(self, chat_id: str):
+        """Sendet alle relevanten Werte und Statusübersicht"""
+        try:
+            msg = "\U0001F4CA <b>Alle relevanten Werte</b>\n\n"
+            msg += f"Modus: {self.config.get('mode','auto')}\n"
+            msg += f"Grid-Modus: {self.config.get('grid_mode','auto')}\n"
+            msg += f"Grid-Anzahl: {self.config.get('grid_count','?')}\n"
+            msg += f"Gridspacing: {self.config.get('grid_size','auto')} USDT\n"
+            msg += f"Grid-Bereich: {self.config.get('grid_lower_price','auto'):.2f} - {self.config.get('grid_upper_price','auto'):.2f} USDT\n"
+            msg += f"Aktueller Kurs: {self.current_price:.2f} USDT\n"
+            if self.grid_prices:
+                msg += f"\n<b>Aktuelle Grid-Levels:</b>\n"
+                msg += ', '.join([f"{g:.2f}" for g in self.grid_prices]) + "\n"
+            msg += f"\nInvestment pro Grid: {self.config.get('investment_amount','?')} USDT\n"
+            msg += f"Hebel: {self.config.get('leverage','?')}x\n"
+            msg += f"Gebühren: {self.config.get('fee_rate',0)*100:.3f}%\n"
+            msg += f"Stop-Loss: {self.config.get('stop_loss_pct',0)*100:.1f}%\n"
+            msg += f"Take-Profit: {self.config.get('take_profit_pct',0)*100:.1f}%\n"
+            msg += f"Live Trading: {'Aktiv' if self.config.get('live_trading_enabled') else 'Inaktiv'}\n"
+            msg += f"\n<b>Kontostand:</b> {self.current_balance:.2f} USDT\n"
+            msg += f"\n<b>Offene Positionen:</b> {len(self.positions)}\n"
+            if self.positions:
+                for i, pos in enumerate(self.positions, 1):
+                    msg += f"{i}. {pos['side'].upper()} | Einstieg: {pos['entry_price']:.2f} | Größe: {pos['size']:.6f} | Hebel: {pos['leverage']}x\n"
+            if self.trades:
+                msg += f"\n<b>Letzte Trades:</b>\n"
+                for trade in self.trades[-5:]:
+                    emoji = '🟢' if trade['pnl'] > 0 else '🔴'
+                    msg += f"{emoji} {trade['side'].upper()}: {trade['pnl']:.2f} USDT | Preis: {trade['price']:.2f} | Größe: {trade['size']:.4f}\n"
+            self.send_telegram_message(msg)
+        except Exception as e:
+            self.send_telegram_message(f"❌ Fehler bei /all: {str(e)}")
 
 def main():
     """Main function to run the bot"""

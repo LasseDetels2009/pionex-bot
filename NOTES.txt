@@ -16,6 +16,9 @@ git push
 3. Änderungen auf VM holen wenn VM verbunden
 cd pionex_bot
 git pull
+4. neuen Docker bauen
+sudo docker-compose build
+sudo docker-compose up -d
 ./deploy.sh
 
 
@@ -24,3 +27,11 @@ screen -S pionex-bot
 python3 run_pionex_bot.py
 --> Mit Strg+A, dann D trennst du die Session (der Bot läuft weiter).
 --> Mit screen -r pionex-bot kannst du später wieder „reinschauen“.
+
+
+
+Hinflug 54000 Meilen + 350€
+Rückflug 22000 Meilen + 250€
+Sao Paulo Floripa 150
+
+76000 Meilen + 750€
