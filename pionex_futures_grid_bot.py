@@ -48,7 +48,10 @@ class PionexFuturesGridBot:
         20: ("live_trading_interval_seconds", "Live-Trading Loop-Intervall (Sekunden)"),
         21: ("enable_profitability_check", "Profitabilitätsprüfung aktiv (1=ja,0=nein)"),
         22: ("min_grid_pct_for_profit_check", "Min. Grid-% für Profit-Check (z.B. 0.1)"),
-        23: ("min_grid_abs_warn", "Warnung bei Grid-Abstand < X USDT (z.B. 130)")
+        23: ("min_grid_abs_warn", "Warnung bei Grid-Abstand < X USDT (z.B. 130)"),
+        24: ("grid_mode", "Grid-Modus: auto/statisch"),
+        25: ("grid_lower_price", "Untere Grid-Grenze (USDT oder 'auto')"),
+        26: ("grid_upper_price", "Obere Grid-Grenze (USDT oder 'auto')"),
     }
     
     def __init__(self, config_file: str = "pionex_config.json"):
